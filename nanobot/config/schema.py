@@ -29,7 +29,7 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.nanobot/workspace"
+    workspace: str = "~/.lumi/workspace"
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -150,6 +150,14 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class MemuConfig(Base):
+    """memU memory server configuration."""
+
+    enabled: bool = False
+    url: str = "http://127.0.0.1:8000"
+    api_key: str = ""
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -158,6 +166,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    memu: MemuConfig = Field(default_factory=MemuConfig)
 
     @property
     def workspace_path(self) -> Path:
