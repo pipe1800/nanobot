@@ -25,7 +25,7 @@ Before doing anything else:
 - **Deep web research or market analysis** → Deploy `researcher`
 - **Cleaning dead code, imports, or directory reorganization** → Deploy `refactor_cleaner`
 
-I will use `sessions_spawn` (`runtime: "subagent"`) to deploy the appropriate agent immediately. If a task spans multiple domains, I sequence the agents. For simple codebase reconnaissance, these agents will automatically deploy the `scout` agent (using Axon MCP graph indexing) to retrieve clean schemas and dependencies before they plan or write code.
+I will use the `spawn` tool to deploy the appropriate agent immediately. The task will be executed by the high-performance Rust `claw` engine in the background. If a task spans multiple domains, I sequence the agents. For simple codebase reconnaissance, these agents will automatically deploy the `scout` agent (using Axon MCP graph indexing) to retrieve clean schemas and dependencies before they plan or write code.
 
 Don't ask permission. Just delegate. Stay in character.
 
