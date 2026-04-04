@@ -232,7 +232,68 @@ class SubagentManager:
                 stderr=asyncio.subprocess.PIPE,
             )
             
-            stdout, stderr = await process.communicate()
+            async def _poll_state():
+                last_size = 0
+                while True:
+                    try:
+                        if session_file.exists():
+                            stat = session_file.stat()
+                            if stat.st_size > last_size:
+                                with open(session_file, "r", encoding="utf-8") as f:
+                                    lines = f.readlines()
+                                last_size = stat.st_size
+                                
+                                phase = "planning"
+                                blocker = None
+                                
+                                for line in lines:
+                                    try:
+                                        data = json.loads(line)
+                                        if data.get("type") == "message":
+                                            msg = data.get("message", {})
+                                            if msg.get("role") == "assistant":
+                                                for block in msg.get("blocks", []):
+                                                    if block.get("type") == "tool_use":
+                                                        name = block.get("name")
+                                                        if name in ["bash"]:
+                                                            phase = "testing"
+                                                        elif name in ["edit_file", "write_file"]:
+                                                            phase = "coding"
+                                                        elif name in ["read_file", "glob_search", "grep_search"]:
+                                                            phase = "planning"
+                                            elif msg.get("role") == "tool":
+                                                for block in msg.get("blocks", []):
+                                                    if block.get("type") == "tool_result":
+                                                        if block.get("is_error"):
+                                                            output = block.get("output", "")
+                                                            if isinstance(output, str):
+                                                                blocker = output[:100] + "..."
+                                                            elif isinstance(output, dict):
+                                                                blocker = str(output.get("stderr", output.get("stdout", "")))[:100] + "..."
+                                                        else:
+                                                            blocker = None
+                                    except:
+                                        pass
+                                
+                                if agent_id in self._agents:
+                                    self._agents[agent_id]["phase"] = phase
+                                    self._agents[agent_id]["blocker"] = blocker
+                                    self._agents[agent_id]["branchFreshness"] = "Active"
+                                    self._save_state()
+                    except Exception as e:
+                        logger.error("Error polling state for {}: {}", agent_id, e)
+                    await asyncio.sleep(1)
+
+            poll_task = asyncio.create_task(_poll_state())
+            
+            try:
+                stdout, stderr = await process.communicate()
+            finally:
+                poll_task.cancel()
+                
+            if agent_id in self._agents:
+                self._agents[agent_id]["phase"] = "completed" if process.returncode == 0 else "failed"
+                self._save_state()
             
             if process.returncode != 0:
                 error_output = stderr.decode().strip()
