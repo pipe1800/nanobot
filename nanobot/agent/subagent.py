@@ -122,84 +122,136 @@ class SubagentManager:
         self,
         agent_id: str,
     ) -> None:
-        """Execute the subagent task and announce the result."""
+        """Execute the subagent task using the claw binary."""
         agent_state = self._agents[agent_id]
         label = agent_state["label"]
         origin = agent_state["origin"]
         messages = agent_state["messages"]
         
-        logger.info("Subagent [{}] starting processing", agent_id)
+        logger.info("Subagent [{}] starting processing via claw", agent_id)
 
         try:
-            # Build subagent tools (no message tool, no spawn tool)
-            tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
-            extra_read = [BUILTIN_SKILLS_DIR] if allowed_dir else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir, extra_allowed_dirs=extra_read))
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-            ))
-            tools.register(WebSearchTool(config=self.web_search_config, proxy=self.web_proxy))
-            tools.register(WebFetchTool(proxy=self.web_proxy))
+            # Get the latest user message
+            last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+            
+            # Prepare environment variables for claw
+            env = {}
+            model_lower = self.model.lower()
+            if "gemini" in model_lower:
+                env["OPENAI_API_KEY"] = self.provider.api_key or ""
+                env["OPENAI_BASE_URL"] = "http://localhost:4000/v1"
+                env["GEMINI_API_KEY"] = self.provider.api_key or ""
+            elif "claude" in model_lower or "anthropic" in model_lower:
+                env["ANTHROPIC_API_KEY"] = self.provider.api_key or ""
+            else:
+                # Fallback to OpenAI compat
+                env["OPENAI_API_KEY"] = self.provider.api_key or ""
+                if self.provider.api_base:
+                    env["OPENAI_BASE_URL"] = self.provider.api_base
 
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
+            # Write .claw/settings.json to sync MCP servers and tools
+            claw_dir = self.workspace / ".claw"
+            claw_dir.mkdir(exist_ok=True)
+            
+            # Ensure session directory exists
+            sessions_dir = claw_dir / "sessions"
+            sessions_dir.mkdir(exist_ok=True)
+            
+            # Create session file if it doesn't exist
+            session_file = sessions_dir / f"{agent_id}.jsonl"
+            if not session_file.exists():
+                import time
+                now_ms = int(time.time() * 1000)
+                meta_record = {
+                    "type": "session_meta",
+                    "version": 1,
+                    "session_id": agent_id,
+                    "created_at_ms": now_ms,
+                    "updated_at_ms": now_ms
+                }
+                
+                lines = [json.dumps(meta_record)]
+                
+                # Convert all messages EXCEPT the last user message (which we pass via CLI)
+                for msg in messages[:-1]:
+                    role = msg["role"]
+                    content = msg.get("content", "")
+                    
+                    blocks = []
+                    if content:
+                        blocks.append({"type": "text", "text": content})
+                        
+                    if blocks:
+                        msg_record = {
+                            "type": "message",
+                            "message": {
+                                "role": role,
+                                "blocks": blocks
+                            }
+                        }
+                        lines.append(json.dumps(msg_record))
+                        
+                with open(session_file, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+            
+            # Get MCP servers from nanobot config
+            from nanobot.config.loader import load_config
+            config = load_config()
+            mcp_servers = {}
+            if config and config.tools and config.tools.mcp_servers:
+                for k, v in config.tools.mcp_servers.items():
+                    server_dict = v.model_dump(exclude_none=True)
+                    if "type" not in server_dict:
+                        server_dict["type"] = "stdio" if server_dict.get("command") else "sse"
+                    mcp_servers[k] = server_dict
+            
+            settings = {
+                "mcpServers": mcp_servers
+            }
+            
+            with open(claw_dir / "settings.json", "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
 
-            while iteration < max_iterations:
-                iteration += 1
+            # Run claw binary
+            claw_bin = str(self.workspace.parent.parent / "Lumi" / "claw-code-temp" / "rust" / "target" / "debug" / "claw")
+            
+            # We use the absolute path to the session file for claw
+            cmd = [
+                claw_bin,
+                "--model", self.model,
+                "--output-format", "json",
+                "--resume", str(session_file),
+                "prompt", last_user_msg
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                env={**__import__("os").environ, **env},
+                cwd=str(self.workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_output = stderr.decode().strip()
+                raise Exception(f"Claw process failed with code {process.returncode}: {error_output}")
+                
+            # Parse claw JSON output
+            try:
+                output_data = json.loads(stdout.decode().strip())
+                final_result = output_data.get("message", "Task completed but no message was returned.")
+            except json.JSONDecodeError:
+                final_result = stdout.decode().strip()
+                if not final_result:
+                    final_result = "Task completed but output could not be parsed."
 
-                response = await self.provider.chat_with_retry(
-                    messages=messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                )
+            # Append assistant response to our state
+            messages.append({"role": "assistant", "content": final_result})
+            self._save_state()
 
-                if response.has_tool_calls:
-                    tool_call_dicts = [
-                        tc.to_openai_tool_call()
-                        for tc in response.tool_calls
-                    ]
-                    messages.append(build_assistant_message(
-                        response.content or "",
-                        tool_calls=tool_call_dicts,
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    ))
-
-                    # Execute tools
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.debug("Subagent [{}] executing: {} with arguments: {}", agent_id, tool_call.name, args_str)
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
-                            "content": result,
-                        })
-                    self._save_state()
-                else:
-                    final_result = response.content
-                    messages.append(build_assistant_message(
-                        final_result or "",
-                        reasoning_content=response.reasoning_content,
-                        thinking_blocks=response.thinking_blocks,
-                    ))
-                    self._save_state()
-                    break
-
-            if final_result is None:
-                final_result = "Task completed but no final response was generated."
-
-            logger.info("Subagent [{}] completed successfully", agent_id)
+            logger.info("Subagent [{}] completed successfully via claw", agent_id)
             await self._announce_result(agent_id, label, final_result, origin, "ok")
 
         except Exception as e:

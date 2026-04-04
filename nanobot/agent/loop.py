@@ -288,16 +288,35 @@ class AgentLoop:
         ))
 
     async def _handle_restart(self, msg: InboundMessage) -> None:
-        """Restart the process in-place via os.execv."""
+        """Restart all servers using start-all.sh."""
         await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
+            channel=msg.channel, chat_id=msg.chat_id, content="Restarting all servers...",
         ))
 
         async def _do_restart():
             await asyncio.sleep(1)
-            # Use -m nanobot instead of sys.argv[0] for Windows compatibility
-            # (sys.argv[0] may be just "nanobot" without full path on Windows)
-            os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
+            import subprocess
+            import os
+            from pathlib import Path
+            
+            # Find the start-all.sh script
+            workspace = Path(os.environ.get("NANOBOT_WORKSPACE", os.path.expanduser("~/.nanobot/workspace")))
+            lumi_dir = workspace.parent.parent / "Lumi"
+            script_path = lumi_dir / "start-all.sh"
+            
+            if script_path.exists():
+                # Run the restart script in a detached session so it survives nanobot shutting down
+                subprocess.Popen(
+                    ["bash", str(script_path), "restart"],
+                    cwd=str(lumi_dir),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+            else:
+                # Fallback to in-place restart if script not found
+                import sys
+                os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
 
         asyncio.create_task(_do_restart())
 
